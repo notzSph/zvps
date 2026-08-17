@@ -3,7 +3,7 @@ set -Eeuo pipefail
 shopt -s extglob
 
 # ============================================================================
-# Harden fresh Ubuntu VPS for SSH-only admin + Docker workloads
+# Harden a fresh Ubuntu VPS for SSH-only administration and role-specific workloads
 # Tested target: Ubuntu 26.04
 # Editor preference: vim
 # ============================================================================
@@ -267,6 +267,7 @@ collect_authorized_keys_for_user() {
 
 init_logging
 require_root
+ZVPS_PROFILE="${ZVPS_PROFILE:-generic}"
 
 echo "============================================================================"
 echo "Fresh VPS hardening bootstrap"
@@ -283,22 +284,59 @@ echo "- configure Fail2ban, unattended upgrades, sudo hardening"
 echo "- enable AppArmor, sysctl hardening, module blocklists"
 echo "- install auditd and AIDE"
 echo "- remove unnecessary services/packages"
-echo "- install/harden Docker"
-echo "- add a DOCKER-USER firewall guard"
+echo "- optionally install/harden Docker"
+echo "- add a DOCKER-USER firewall guard when Docker is installed"
 echo
 echo "It will NOT clone OpenClaw or any application repo."
 echo
+
+if [[ "$ZVPS_PROFILE" == "openclaw" ]]; then
+  echo "OpenClaw policy: WireGuard must already be configured and up before this bootstrap runs."
+  echo "The bootstrap will permit public UDP only for the existing WireGuard listener; SSH will be allowed on wg0 only."
+  if ! command -v wg >/dev/null 2>&1 || ! wg show wg0 >/dev/null 2>&1; then
+    echo "Refusing OpenClaw bootstrap: wg0 is not active. Configure and verify WireGuard first; never bootstrap a private host with public SSH as a fallback."
+    exit 1
+  fi
+  WG_LISTEN_PORT="$(wg show wg0 listen-port 2>/dev/null || true)"
+  if ! [[ "$WG_LISTEN_PORT" =~ ^[0-9]+$ ]] || [[ "$WG_LISTEN_PORT" == "0" ]]; then
+    echo "Refusing OpenClaw bootstrap: could not determine the wg0 listening port."
+    exit 1
+  fi
+fi
 
 HOSTNAME_NEW="$(ask 'Hostname' 'zMainX')"
 TIMEZONE_NEW="$(ask 'Timezone' 'America/New_York')"
 SSH_PORT="$(ask 'SSH port' '2222')"
 USERS_CSV="$(ask 'SSH users, comma-separated' 'zsph')"
-ADMIN_IPS_CSV="$(ask 'Trusted admin public IPs for SSH/UFW, comma-separated; leave blank to allow SSH from anywhere')"
+if [[ "$ZVPS_PROFILE" == "openclaw" ]]; then
+  ADMIN_IPS_CSV=""
+else
+  ADMIN_IPS_CSV="$(ask 'Trusted admin public IPs for SSH/UFW, comma-separated; leave blank to allow SSH from anywhere')"
+fi
 PUBLIC_IFACE_DEFAULT="$(detect_default_iface || true)"
 PUBLIC_IFACE="$(ask 'Public network interface' "${PUBLIC_IFACE_DEFAULT:-ens6}")"
-PERMIT_OPEN_CSV="$(ask 'Allowed SSH local tunnel targets, comma-separated; use none to disable forwarding' '127.0.0.1:18789,127.0.0.1:18790')"
-DOCKER_POOL_BASE="$(ask 'Docker default address pool base' '172.30.0.0/16')"
-DOCKER_POOL_SIZE="$(ask 'Docker default address pool size' '24')"
+if ask_yes_no "Allow VS Code Remote SSH dynamic/local TCP forwarding for admin users?" "y"; then
+  VSCODE_FORWARDING="yes"
+  PERMIT_OPEN_CSV=""
+else
+  VSCODE_FORWARDING="no"
+  PERMIT_OPEN_CSV="$(ask 'Allowed SSH local tunnel targets, comma-separated; use none to disable forwarding' '127.0.0.1:18789,127.0.0.1:18790')"
+fi
+if [[ "$ZVPS_PROFILE" == "websites" ]]; then
+  DOCKER_DEFAULT="n"
+else
+  DOCKER_DEFAULT="y"
+fi
+
+if ask_yes_no "Install and harden Docker for this host?" "$DOCKER_DEFAULT"; then
+  INSTALL_DOCKER="yes"
+  DOCKER_POOL_BASE="$(ask 'Docker default address pool base' '172.30.0.0/16')"
+  DOCKER_POOL_SIZE="$(ask 'Docker default address pool size' '24')"
+else
+  INSTALL_DOCKER="no"
+  DOCKER_POOL_BASE=""
+  DOCKER_POOL_SIZE=""
+fi
 
 validate_ssh_port "$SSH_PORT"
 validate_required_csv "SSH users" "$USERS_CSV"
@@ -312,7 +350,10 @@ if [[ "${#USERS[@]}" -eq 0 ]]; then
 fi
 
 ADMIN_IPS_CSV="$(trim_whitespace "$ADMIN_IPS_CSV")"
-if [[ -n "$ADMIN_IPS_CSV" ]]; then
+if [[ "$ZVPS_PROFILE" == "openclaw" ]]; then
+  ADMIN_IPS=()
+  SSH_ACCESS_MODE="wireguard"
+elif [[ -n "$ADMIN_IPS_CSV" ]]; then
   comma_to_array_compact "$ADMIN_IPS_CSV"
   ADMIN_IPS=("${OUT_ARRAY[@]}")
   SSH_ACCESS_MODE="restricted"
@@ -337,13 +378,19 @@ echo "Users: ${USERS[*]}"
 if [[ "$SSH_ACCESS_MODE" == "restricted" ]]; then
   echo "SSH access mode: restricted to trusted IPs"
   echo "Trusted admin IPs: ${ADMIN_IPS[*]}"
+elif [[ "$SSH_ACCESS_MODE" == "wireguard" ]]; then
+  echo "SSH access mode: WireGuard-only on wg0; public UDP $WG_LISTEN_PORT is retained for the tunnel"
 else
   echo "SSH access mode: public, any source IP can reach TCP $SSH_PORT"
   echo "Trusted admin IPs: none"
 fi
 echo "Public interface: $PUBLIC_IFACE"
 echo "PermitOpen targets: ${PERMIT_OPENS[*]:-none}"
-echo "Docker pool: $DOCKER_POOL_BASE size $DOCKER_POOL_SIZE"
+echo "VS Code Remote SSH forwarding: $VSCODE_FORWARDING"
+echo "Install Docker: $INSTALL_DOCKER"
+if [[ "$INSTALL_DOCKER" == "yes" ]]; then
+  echo "Docker pool: $DOCKER_POOL_BASE size $DOCKER_POOL_SIZE"
+fi
 echo "Log file: $LOG_FILE"
 echo
 
@@ -438,7 +485,16 @@ X11Forwarding no
 AllowAgentForwarding no
 EOF
 
-if [[ "${#PERMIT_OPENS[@]}" -gt 0 ]]; then
+if [[ "$VSCODE_FORWARDING" == "yes" ]]; then
+  {
+    echo
+    echo "# VS Code Remote SSH uses local/dynamic forwarding to a random remote server port."
+    echo "# Local forwarding only; remote forwarding, public listeners and agent forwarding stay disabled."
+    echo "AllowTcpForwarding local"
+    echo "PermitOpen any"
+    echo "DisableForwarding no"
+  } >> /etc/ssh/sshd_config.d/00-hardening.conf
+elif [[ "${#PERMIT_OPENS[@]}" -gt 0 ]]; then
   {
     echo
     echo "# Allow local SSH tunnels only for explicitly approved loopback services."
@@ -515,8 +571,16 @@ if [[ "$SSH_ACCESS_MODE" == "restricted" ]]; then
   for ip in "${ADMIN_IPS[@]}"; do
     ufw allow from "$ip" to any port "$SSH_PORT" proto tcp comment "Admin SSH $ip"
   done
+elif [[ "$SSH_ACCESS_MODE" == "wireguard" ]]; then
+  ufw allow "$WG_LISTEN_PORT/udp" comment "WireGuard tunnel"
+  ufw allow in on wg0 to any port "$SSH_PORT" proto tcp comment "Admin SSH via WireGuard"
 else
   ufw allow "$SSH_PORT/tcp" comment "Public SSH"
+fi
+
+if [[ "$ZVPS_PROFILE" == "apps" || "$ZVPS_PROFILE" == "websites" ]]; then
+  ufw allow 80/tcp comment "Public HTTP"
+  ufw allow 443/tcp comment "Public HTTPS"
 fi
 
 ufw --force enable
@@ -529,12 +593,20 @@ if [[ "$SSH_ACCESS_MODE" == "restricted" ]]; then
   for ip in "${ADMIN_IPS[@]}"; do
     echo "- $ip/32"
   done
+elif [[ "$SSH_ACCESS_MODE" == "wireguard" ]]; then
+  echo "ALLOW UDP $WG_LISTEN_PORT from the approved WireGuard peers."
+  echo "Do not expose TCP $SSH_PORT publicly; SSH is allowed only over wg0."
 else
   echo "ALLOW TCP $SSH_PORT from anywhere:"
   echo "- 0.0.0.0/0"
   echo "- ::/0 if using IPv6"
 fi
-echo "Remove public rules for 22, 80, 443, 8443, 8447 unless needed."
+if [[ "$ZVPS_PROFILE" == "apps" || "$ZVPS_PROFILE" == "websites" ]]; then
+  echo "ALLOW TCP 80 and 443 from anywhere for public web traffic."
+  echo "Remove public rules for 22, 8443, 8447, and every unapproved application port."
+else
+  echo "Remove public rules for 22, 80, 443, 8443, 8447 unless explicitly required."
+fi
 pause
 
 echo
@@ -582,7 +654,7 @@ cat > /etc/apt/apt.conf.d/52unattended-upgrades-local <<'EOF'
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 Unattended-Upgrade::Automatic-Reboot-Time "23:00";
 EOF
@@ -606,8 +678,14 @@ chmod 440 /etc/sudoers.d/99-hardening
 visudo -c
 
 echo
-echo "Root password is intentionally NOT locked for provider console recovery."
 echo "Root SSH remains disabled."
+echo "Keep a root password when the hosting panel's remote console requires it. Root SSH remains blocked independently."
+if ask_yes_no "Lock the OS root password and give up password-based remote-console recovery?" "n"; then
+  passwd -l root
+else
+  echo "Root password remains available for hosting-panel remote-console recovery."
+fi
+passwd -S root
 
 echo
 echo "============================================================================"
@@ -628,8 +706,9 @@ cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
 # Kernel and network hardening
 # ============================================================================
 
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+# Loose reverse-path filtering is safe for cloud /32 and asymmetric routing.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
@@ -776,6 +855,7 @@ echo "==========================================================================
 echo "14. Docker install/hardening"
 echo "============================================================================"
 
+if [[ "$INSTALL_DOCKER" == "yes" ]]; then
 if ! command -v docker >/dev/null 2>&1; then
   apt-get update
   apt-get install -y ca-certificates curl gnupg
@@ -914,6 +994,9 @@ systemctl daemon-reload
 systemctl enable --now docker-user-firewall.service
 systemctl status docker-user-firewall.service --no-pager || true
 iptables -S DOCKER-USER
+else
+  echo "Skipped Docker install and DOCKER-USER firewall by operator choice."
+fi
 
 echo
 echo "============================================================================"
@@ -958,7 +1041,9 @@ ufw status verbose
 fail2ban-client status sshd || true
 aa-status || true
 auditctl -l
-iptables -S DOCKER-USER
+if [[ "$INSTALL_DOCKER" == "yes" ]]; then
+  iptables -S DOCKER-USER
+fi
 
 echo
 echo "============================================================================"
@@ -975,12 +1060,20 @@ if [[ "$SSH_ACCESS_MODE" == "restricted" ]]; then
   for ip in "${ADMIN_IPS[@]}"; do
     echo "     - $ip/32"
   done
+elif [[ "$SSH_ACCESS_MODE" == "wireguard" ]]; then
+  echo "   - ALLOW UDP $WG_LISTEN_PORT from approved WireGuard peers."
+  echo "   - Do not expose TCP $SSH_PORT publicly; SSH is allowed only over wg0."
 else
   echo "   - ALLOW TCP $SSH_PORT from anywhere:"
   echo "     - 0.0.0.0/0"
   echo "     - ::/0 if using IPv6"
 fi
-echo "   - Remove public allow rules for 22, 80, 443, 8443, 8447 unless needed."
+if [[ "$ZVPS_PROFILE" == "apps" || "$ZVPS_PROFILE" == "websites" ]]; then
+  echo "   - ALLOW TCP 80 and 443 from anywhere for public web traffic."
+  echo "   - Remove public allow rules for 22, 8443, 8447, and unapproved application ports."
+else
+  echo "   - Remove public allow rules for 22, 80, 443, 8443, 8447 unless explicitly required."
+fi
 echo
 echo "2. Test SSH for each user/device:"
 echo "   ssh -p $SSH_PORT USER@SERVER_IP"
